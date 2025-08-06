@@ -1,0 +1,380 @@
+# ---- Общие reusable настройки для Airflow (anchor) ----
+# Определяем шаблон (anchor) x-airflow-common, который потом разворачиваем в нескольких сервисах (webserver, scheduler, worker, init).
+x-airflow-common: &airflow-common
+  # build: указывает, что образ собирется из локальной папки ./airflow_dockerfile используя файл Dockerfile
+  build:
+    context: ./airflow
+    dockerfile: Dockerfile
+  user: "${AIRFLOW_UID}:${AIRFLOW_GID}"
+  env_file:
+    - .env
+  environment:
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor # Устанавливает исполнителя задач Airflow -> CeleryExecutor (распараллеливание через брокер/воркеры)
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow # Строка подключения Airflow к базе метаданных (Postgres). hostname 'postgres' — имя сервиса ниже.
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow  # Беканд результатов Celery (хранение результатов задач) — здесь используется Postgres
+    AIRFLOW__CELERY__BROKER_URL: redis://redis:6379/0 # URL брокера сообщений для Celery (Redis). hostname 'redis' — сервис ниже.
+    AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY} # Ключ Fernet для шифрования переменных/паролей в Airflow (подставляется из .env)
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'  # Флаг: по умолчанию новые DAG'и будут в паузе при создании (строка 'true' — обязательно в кавычках)
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false' # Запретить загрузку example DAG'ов при инициализации (не захламляет UI)
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: 5 # Как часто (в секундах) шедулер перечитывает директорию с DAG'ами
+    _AIRFLOW_DB_MIGRATE: 'true' # Переменная для init-контейнера: указывает выполнять миграции БД при инициализации
+    _AIRFLOW_WWW_USER_CREATE: 'true' # При инициализации создать веб-пользователя (см. _AIRFLOW_WWW_USER_USERNAME/_PASSWORD)
+    _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME}
+    _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD}
+
+  volumes:
+    - ./data_lake:/opt/data_lake # Монтируем локальную папку data_lake в контейнер (место для исходных/временных данных)
+    - ./data_lake/monitoring:/opt/data_lake/monitoring # Отдельная подпапка для мониторинга/логов внутри data_lake
+    - ./synthetic_data:/opt/synthetic_data # Папка со синтетическими данными (используется для примеров/тестов)
+    - ./dags:/opt/airflow/dags # Папка с DAG'ами (разрабатываемые DAG'и автоматически видны Airflow)
+    - ./logs:/opt/airflow/logs  # Логи Airflow (монтируем, чтобы сохранять и просматривать локально)
+    - ./plugins:/opt/airflow/plugins  # Плагины Airflow (кастомные оператор/сенсоры
+    - ./scripts:/opt/airflow/scripts # Скрипты для инициализации и утилиты внутри контейнера
+    - ./dbt_click:/opt/dbt_click # Место для dbt-проекта (если используешь dbt для трансформаций в ClickHouse)
+
+  depends_on:
+    postgres:
+      condition: service_healthy # Указывает, что Airflow зависит от сервиса postgres и ждёт его состояния healthy (нужен healthcheck в postgres)
+
+  networks:
+    - all_in_one # Подключаем контейнер к пользовательской сети all_in_one (все сервисы в одной сети)
+
+# ---- Обычная секция services: определение всех контейнеров ----
+services:
+  # ---------- Postgres (метаданные Airflow + прочее) ----------
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    command: ["postgres", "-c", "wal_level=logical"] # Запускаем postgres с опцией wal_level=logical (нужно для логической репликации/CDC)
+    ports:
+      - "5432:5432"
+    restart: always  # Политика рестарта: всегда перезапускать при падении
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data  # Именованный том Docker для постоянного хранения данных Postgres
+      - ./src/init_db:/docker-entrypoint-initdb.d # SQL/скрипты в этом каталоге будут выполнены при первом старте контейнера
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-U", "airflow" ] # Команда проверки работоспособности БД (pg_isready)
+      interval: 5s
+      retries: 5
+    networks:
+      - all_in_one
+
+  # ---------- Redis (брокер сообщений для Celery) ----------
+  redis:
+    image: redis:latest
+    container_name: redis
+    ports:
+      - "6379:6379"
+    networks:
+      - all_in_one
+
+  # ---------- ClickHouse (аналитическая СУБД) ----------
+  clickhouse:
+    image: yandex/clickhouse-server:latest
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+    ports:
+      - "8123:8123"   # HTTP интерфейс ClickHouse (REST/HTTP)
+      - "9000:9000"   # Native TCP интерфейс ClickHouse
+    volumes:
+      - ./clickhouse:/var/lib/clickhouse  # Директория данных ClickHouse (локальная) — можно заменить на именованный том
+      - ./data_lake:/opt/data_lake # Монтируем data_lake (совместный доступ к данным)
+      - ./docker_related_config.xml:/etc/clickhouse-server/config.d/docker_related_config.xml # Кастомный конфиг ClickHouse (при необходимости)
+      - ./clickhouse/init:/docker-entrypoint-initdb.d # SQL/скрипты для инициализации ClickHouse при первом старте
+    networks:
+      - all_in_one
+
+  # ---------- Airflow webserver (использует шаблон airflow-common) ----------
+  af-webserver:
+    <<: *airflow-common # Разворачиваем все поля из анкора &airflow-common (build, volumes, env и т.д.)
+    container_name: af-webserver
+    command: webserver # При запуске контейнера будет выполняться команда "airflow webserver"
+    ports:
+      - "8080:8080"
+    restart: always
+
+  # ---------- Airflow scheduler ----------
+  af-scheduler:
+    <<: *airflow-common
+    container_name: af-scheduler
+    command: scheduler # Запускает планировщик задач Airflow
+    restart: always
+
+  # ---------- Airflow worker (Celery worker) ----------
+  af-worker:
+    <<: *airflow-common
+    container_name: af-worker
+    command: celery worker # Запускает процесс Celery worker для выполнения задач
+    ports:
+      - "4041:4041" # Порт для внутренних/внешних метрик/мониторинга воркера (опционально)
+    restart: always
+
+  # ---------- Контейнер для инициализации Airflow (выполнение миграций, создание подключений/пользователя) ----------
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    command:     # внимание: команды `airflow connections add` требуют, чтобы команда `airflow` была доступна в PATH внутри образа.
+      - bash
+      - -c
+      - |
+          echo "Airflow version"
+          airflow version
+          airflow connections add 'spark_default' \
+            --conn-type 'spark' \
+            --conn-host 'local' \
+            --conn-extra '{"spark-binary": "spark-submit", "deploy-mode": "client"}'
+
+          airflow connections add 'backend_db' \
+            --conn-type 'postgres' \
+            --conn-host 'postgres' \
+            --conn-login "${POSTGRES_USER}" \
+            --conn-password "${POSTGRES_PASSWORD}" \
+            --conn-schema 'backend' \
+            --conn-port 5432
+        
+          airflow connections add 'metadata_db' \
+            --conn-type 'postgres' \
+            --conn-host 'postgres' \
+            --conn-login "${POSTGRES_USER}" \
+            --conn-password "${POSTGRES_PASSWORD}" \
+            --conn-schema 'metadata' \
+            --conn-port 5432
+        
+          airflow connections add 'minios3_conn' \
+            --conn-type 'aws' \
+            --conn-login "${MINIO_ROOT_USER}" \
+            --conn-password "${MINIO_ROOT_PASSWORD}" \
+            --conn-extra '{"endpoint_url": "http://minio:9000"}'
+      # Этот контейнер запускается один раз для инициализации — создает нужные connections в Airflow.
+
+
+  # ---------- Superset (визуализация) ----------
+  superset:
+    container_name: superset
+    build:
+      context: ./superset
+      dockerfile: Dockerfile
+    environment:
+      ADMIN_USERNAME: ${SUPERSET_ADMIN_USERNAME}
+      ADMIN_EMAIL: ${SUPERSET_ADMIN_EMAIL}
+      ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD}
+        # Переменные для создания админа Superset (подставляются из .env)
+    volumes:
+      - ./superset_data:/app/superset_home # Хранилище данных Superset (база sqlite, кэш, плагины)
+    ports:
+      - '8088:8088' # Порт Superset UI
+    depends_on:
+      - postgres # Superset зависит от Postgres (если используется для метаданных)
+    networks:
+      - all_in_one
+
+  # ---------- Jupyter Notebook (с PySpark) ----------
+  jupyter:
+    container_name: jupyter_notebook
+    build:
+      context: ./jupyter_dockerfile
+      dockerfile: Dockerfile
+    ports:
+      - "10000:8888"   # проброс JupyterLab/Notebook
+      - "4040:4040"    # Spark UI/локальные порты (если нужен)
+    volumes:
+      - ./synthetic_data:/home/jovyan/source # Исходные тестовые данные в ноутбуках
+      - ./data_lake:/home/jovyan/data_lake   # Общее хранилище для ноутбуко
+      - ./jupyter_notebook:/home/jovyan # Локальная папка с ноутбуками и конфигами
+    command: jupyter notebook --no-browser --NotebookApp.token='' --NotebookApp.password='' --ip='*' --allow-root # Команда запуска Jupyter без токена/пароля (удобно локально, НО небезопасно в проде)
+    environment:
+      GRANT_SUDO: yes         # Переменные окружения для доступа к MinIO (если используется)
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    user: root       # Запуск от root (иногда нужно чтобы устанавливать пакеты), но не рекомендуется в проде
+    restart: always
+    networks:
+      - all_in_one
+
+  # ---------- Zookeeper (для Kafka) ----------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    hostname: zookeeper
+    container_name: zookeeper
+    ports:
+      - '2181:2181'
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: echo srvr | nc zookeeper 2181 || exit 1         # Проверка статуса Zookeeper через nc (netcat)
+      start_period: 10s
+      retries: 20
+      interval: 10s
+    networks:
+      - all_in_one
+
+  # ---------- Kafka (брокер событий) ----------
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    hostname: kafka
+    container_name: kafka
+    ports:
+      - '29093:29092'  # internal/external mapping (зависит от конфигурации)
+      - '9093:9092'
+      - '9094:9101'
+    environment:
+      KAFKA_BROKER_ID: 1 # Переменные конфигурации Kafka. Параметры advertized listeners важны для доступа извне контейнерной сети.
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29093,PLAINTEXT_HOST://localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_JMX_PORT: 9094
+      KAFKA_JMX_HOSTNAME: localhost
+    healthcheck:  # Проверка доступности порта
+      test: nc -z localhost 9093 || exit -1
+      start_period: 15s
+      interval: 5s
+      timeout: 10s
+      retries: 10
+    networks:
+      - all_in_one
+
+  # ---------- Kafka UI (панель управления) ----------
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    ports:
+      - "8082:8080"
+    depends_on:
+      - kafka
+    environment:         # Конфиг для подключения UI к Kafka кластеру
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29093
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: connect
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://kafka-connect:8083
+    networks:
+      - all_in_one
+
+  # ---------- Kafka Connect (Debezium / коннекторы) ----------
+  kafka-connect:
+      build:
+        context: ./debezium-jmx-exporter
+        args:
+          JMX_AGENT_VERSION: 0.15.0
+      container_name: kafka-connect
+      restart: unless-stopped
+      ports:
+        - "8083:8083"
+        - "1976:1976"
+      depends_on:
+        kafka:
+          condition: service_healthy
+      environment:
+        BOOTSTRAP_SERVERS: kafka:29093
+        GROUP_ID: 1
+        CONFIG_STORAGE_TOPIC: kafka_connect_configs
+        OFFSET_STORAGE_TOPIC: kafka_connect_offsets
+        STATUS_STORAGE_TOPIC: kafka_connect_statuses
+        KAFKA_OPTS: -javaagent:/kafka/etc/jmx_prometheus_javaagent.jar=8080:/kafka/etc/config.yml
+        JMXHOST: localhost
+        JMXPORT: 1976
+      healthcheck:
+            test: [ "CMD-SHELL", "curl -sSf http://localhost:8083/connectors || exit 1" ]
+            interval: 10s
+            timeout: 5s
+            retries: 10
+      networks:
+        - all_in_one
+
+  # ---------- MinIO (S3-совместимое хранилище) ----------
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    ports:
+      - "9001:9001"  # UI (консоль)
+      - "9002:9000"  # API (примечание: хост:порт выбран нестандартно, см. маппинг)
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}         # Корневые креды MinIO — объявлены в .env
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"       # Команда запуска MinIO с указанием адреса консоли
+    volumes:
+      - ./s3_storage:/data # Данные MinIO будут храниться в ./s3_storage локально
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/ready" ] # Проверка готовности MinIO (HTTP эндпоинт)
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - all_in_one
+
+  # ---------- Создание бакетов в MinIO (утилита mc) ----------
+  create-bucket:     # Контейнер запускает клиента mc для создания необходимых бакетов и установки публичной политики.
+    image: minio/mc  # Оператор "|| true" делает команды идемпотентными — если бакет уже есть, команда не вернёт ошибку.
+    entrypoint: >
+      /bin/sh -c " 
+      until mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD}; do
+        echo 'Waiting for MinIO...';
+        sleep 5;
+      done;
+      mc mb -p local/${MINIO_PROD_BUCKET_NAME} || true;
+      mc policy set public local/${MINIO_PROD_BUCKET_NAME} || true;
+      mc mb -p local/${MINIO_DEV_BUCKET_NAME} || true;
+      mc policy set public local/${MINIO_DEV_BUCKET_NAME} || true;
+      "
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - all_in_one
+
+
+
+  # ---------- Prometheus (метрики) ----------
+  prometheus:
+      image: prom/prometheus:v2.43.0
+      container_name: prometheus
+      restart: unless-stopped
+      ports:
+        - "9090:9090"
+      depends_on:
+        kafka-connect:
+          condition: service_healthy
+      volumes:
+        - ./debezium-prometheus/prometheus.yml:/etc/prometheus/prometheus.yml # Кастомный конфиг Prometheus (с правилами/targets)
+      networks:
+        all_in_one:
+
+  # ---------- Grafana (дашборды метрик) ----------
+  grafana:
+      build:
+        context: ./debezium-grafana
+      container_name: grafana
+      restart: unless-stopped
+      ports:
+        - "3000:3000"
+      environment:
+        DS_PROMETHEUS: prometheus
+          # Переменная (позже может быть использована в Dockerfile/entrypoint для предконфигурации datasource)
+      # Если нужен том для сохранения данных grafana — добавь volumes:
+      # volumes:
+      #   - ./grafana:/var/lib/grafana
+      networks:
+        - all_in_one
+
+
+# ---- Именованные тома (volumes) ----
+volumes:
+  postgres-db-volume: # Именованный том для Postgres (Docker сам создаст его в своём storage)
+
+  clickhouse: # Именованный том для ClickHouse (если не хочешь монтировать локальную папку)
+
+
+# ---- Сеть (все сервисы в одной bridge-сети) ----
+networks:
+  all_in_one:
+    driver: bridge
+      # Bridge сеть даёт контейнерам возможность общаться по именам сервисов (DNS внутри Docker)
